@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Aventura lui Matei AR - Deseneaza in aer</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#05070a;font-family:Arial,Helvetica,sans-serif}
+  #stage{position:fixed;inset:0;background:#05070a}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+  #video{transform:scaleX(-1);background:#111}
+  #overlayCanvas{pointer-events:none}
+  #hud{position:fixed;inset:0;pointer-events:none;color:#fff;text-shadow:0 2px 5px #000}
+  .top{position:absolute;left:12px;right:12px;top:10px;display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+  .pill{background:#000a;border:1px solid #ffffff44;border-radius:14px;padding:8px 11px;font-weight:800;backdrop-filter:blur(5px)}
+  #status{max-width:70vw}
+  #gesture{color:#ffd54f}
+  #instructions{position:absolute;left:50%;bottom:92px;transform:translateX(-50%);width:min(92vw,620px);text-align:center;background:#000a;border:1px solid #ffffff44;border-radius:16px;padding:10px 14px;font-weight:800}
+  #toolbar{position:fixed;left:10px;right:10px;bottom:12px;display:flex;justify-content:center;gap:8px;flex-wrap:wrap}
+  button{pointer-events:auto;border:1px solid #ffffff55;border-radius:14px;background:#121922dd;color:#fff;padding:11px 14px;font-size:15px;font-weight:900;box-shadow:0 5px 16px #0007}
+  button.primary{background:#1976d2}
+  button.danger{background:#b71c1c}
+  #start{position:fixed;inset:0;background:radial-gradient(circle at 50% 35%,#15314add,#020408f2);display:flex;align-items:center;justify-content:center;padding:20px;z-index:5}
+  .card{width:min(620px,94vw);background:#111c25;border:4px solid #ffd54f;border-radius:22px;padding:24px;color:#fff;text-align:center;box-shadow:0 20px 70px #000c}
+  .card h1{margin:0 0 8px;font-size:38px;color:#ffd54f}
+  .card p{line-height:1.45}
+  .small{font-size:13px;color:#cfd8dc}
+  #loading{margin:12px 0;color:#90caf9;font-weight:800}
+  #shapeToast{position:fixed;left:50%;top:22%;transform:translateX(-50%);padding:12px 18px;border-radius:16px;background:#000b;color:#fff;font-weight:900;font-size:24px;opacity:0;transition:.2s;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlayCanvas"></canvas>
+</div>
+
+<div id="hud">
+  <div class="top">
+    <div class="pill" id="status">Camera oprita</div>
+    <div class="pill">Gest: <span id="gesture">—</span></div>
+  </div>
+  <div id="instructions">Apropie degetul mare de aratator 🤏 ca sa desenezi. Desparte degetele ca sa opresti desenul.</div>
+</div>
+
+<div id="toolbar">
+  <button id="clearBtn" class="danger">🗑 Sterge desenul</button>
+  <button id="switchBtn">🔄 Schimba camera</button>
+  <button id="handBtn">🖐 Repere mana: ON</button>
+  <button id="saveBtn" class="primary">💾 Salveaza desenul</button>
+</div>
+
+<div id="shapeToast"></div>
+
+<div id="start">
+  <div class="card">
+    <h1>✨ Aventura lui Matei AR</h1>
+    <h2>Deseneaza in aer</h2>
+    <p>Camera urmareste mana. Cand apropii <b>degetul mare de aratator</b>, varful aratatorului devine un „creion” virtual.</p>
+    <p>Misca mana prin aer si desenul ramane peste imaginea reala.</p>
+    <div id="loading">Modelul pentru mana se va incarca dupa START.</div>
+    <button id="startBtn" class="primary">📷 PORNESTE CAMERA</button>
+    <p class="small">Camera necesita permisiune din browser. Pe telefon, pagina trebuie deschisa prin HTTPS pentru ca accesul la camera sa functioneze in mod normal.</p>
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/vision_bundle.mjs";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlayCanvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const gestureEl = document.getElementById("gesture");
+const startBox = document.getElementById("start");
+const startBtn = document.getElementById("startBtn");
+const clearBtn = document.getElementById("clearBtn");
+const switchBtn = document.getElementById("switchBtn");
+const handBtn = document.getElementById("handBtn");
+const saveBtn = document.getElementById("saveBtn");
+const toast = document.getElementById("shapeToast");
+
+let handLandmarker = null;
+let stream = null;
+let facingMode = "user";
+let showHand = true;
+let lastVideoTime = -1;
+let isDrawing = false;
+let currentStroke = [];
+let strokes = [];
+let smoothed = null;
+let lastPinch = false;
+let inferenceBusy = false;
+
+function resizeCanvas(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  canvas.style.width = innerWidth + "px";
+  canvas.style.height = innerHeight + "px";
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
+async function initModel(){
+  if(handLandmarker) return;
+  statusEl.textContent = "Incarc modelul mainii...";
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.55,
+    minHandPresenceConfidence: 0.55,
+    minTrackingConfidence: 0.5
+  });
+}
+
+async function startCamera(){
+  try{
+    await initModel();
+    if(stream) stream.getTracks().forEach(t=>t.stop());
+    statusEl.textContent = "Pornesc camera...";
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:false,
+      video:{
+        facingMode:{ideal:facingMode},
+        width:{ideal:1280},
+        height:{ideal:720}
+      }
+    });
+    video.srcObject = stream;
+    await video.play();
+    startBox.style.display = "none";
+    statusEl.textContent = "Caut mana...";
+    lastVideoTime = -1;
+    requestAnimationFrame(loop);
+  }catch(err){
+    console.error(err);
+    statusEl.textContent = "Camera/model indisponibil";
+    document.getElementById("loading").textContent =
+      "Eroare: " + (err.message || err) + ". Verifica permisiunea camerei si faptul ca pagina ruleaza prin HTTPS.";
+  }
+}
+
+function mapLandmark(lm){
+  // Front camera video is mirrored with CSS; mirror x so landmarks line up visually.
+  const mirroredX = facingMode === "user" ? 1 - lm.x : lm.x;
+  return {x:mirroredX * innerWidth, y:lm.y * innerHeight, z:lm.z || 0};
+}
+function distance(a,b){return Math.hypot(a.x-b.x,a.y-b.y)}
+
+function analyzeGesture(lms){
+  const thumb = mapLandmark(lms[4]);
+  const index = mapLandmark(lms[8]);
+  const wrist = mapLandmark(lms[0]);
+  const middleMcp = mapLandmark(lms[9]);
+  const palmScale = Math.max(35, distance(wrist,middleMcp));
+  const pinchRatio = distance(thumb,index)/palmScale;
+  return {pinching:pinchRatio < 0.46, index, thumb, pinchRatio};
+}
+
+function smoothPoint(p){
+  if(!smoothed) smoothed = {...p};
+  const alpha=.42;
+  smoothed.x += (p.x-smoothed.x)*alpha;
+  smoothed.y += (p.y-smoothed.y)*alpha;
+  return {...smoothed};
+}
+
+function maybeRecognizeShape(stroke){
+  if(stroke.length < 18) return;
+  let minX=Infinity,minY=Infinity,maxX=-Infinity,maxY=-Infinity,len=0;
+  for(let i=0;i<stroke.length;i++){
+    const p=stroke[i];
+    minX=Math.min(minX,p.x); minY=Math.min(minY,p.y);
+    maxX=Math.max(maxX,p.x); maxY=Math.max(maxY,p.y);
+    if(i) len += distance(p,stroke[i-1]);
+  }
+  const w=maxX-minX,h=maxY-minY;
+  const start=stroke[0], end=stroke[stroke.length-1];
+  const close = distance(start,end) < Math.max(35, Math.min(w,h)*.38);
+  const compact = len > (w+h)*2.25;
+  let label="Forma libera";
+  if(close && compact && w>50 && h>50){
+    const ratio=w/h;
+    label = ratio>.68 && ratio<1.45 ? "CERC / SCUT 🛡️" : "BUCLA MAGICA ✨";
+  }else if(len>250 && w>h*2.1) label="ZID MAGIC 🧱";
+  else if(len>250 && h>w*2.1) label="TURN MAGIC 🗼";
+  showToast(label);
+}
+function showToast(text){
+  toast.textContent=text;
+  toast.style.opacity=1;
+  setTimeout(()=>toast.style.opacity=0,1100);
+}
+
+const connections = [
+ [0,1],[1,2],[2,3],[3,4],
+ [0,5],[5,6],[6,7],[7,8],
+ [5,9],[9,10],[10,11],[11,12],
+ [9,13],[13,14],[14,15],[15,16],
+ [13,17],[17,18],[18,19],[19,20],[0,17]
+];
+
+function drawScene(result){
+  ctx.clearRect(0,0,innerWidth,innerHeight);
+
+  // Existing air drawings
+  ctx.lineCap="round";ctx.lineJoin="round";
+  for(const s of strokes){
+    ctx.strokeStyle="#00e5ff";
+    ctx.shadowColor="#00e5ff";ctx.shadowBlur=12;
+    ctx.lineWidth=8;
+    ctx.beginPath();
+    s.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.stroke();
+  }
+  if(currentStroke.length){
+    ctx.strokeStyle="#ffd54f";ctx.shadowColor="#ffd54f";ctx.shadowBlur=15;ctx.lineWidth=9;
+    ctx.beginPath();
+    currentStroke.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y));
+    ctx.stroke();
+  }
+  ctx.shadowBlur=0;
+
+  if(!result?.landmarks?.length) return;
+  const lms=result.landmarks[0];
+  const pts=lms.map(mapLandmark);
+
+  if(showHand){
+    ctx.strokeStyle="#69f0ae";ctx.lineWidth=3;
+    for(const [a,b] of connections){
+      ctx.beginPath();ctx.moveTo(pts[a].x,pts[a].y);ctx.lineTo(pts[b].x,pts[b].y);ctx.stroke();
+    }
+    pts.forEach((p,i)=>{
+      ctx.fillStyle=(i===4||i===8)?"#ffd54f":"#69f0ae";
+      ctx.beginPath();ctx.arc(p.x,p.y,(i===4||i===8)?7:4,0,Math.PI*2);ctx.fill();
+    });
+  }
+}
+
+async function loop(){
+  if(!stream || !handLandmarker) return;
+
+  let result=null;
+  if(video.readyState>=2 && video.currentTime!==lastVideoTime && !inferenceBusy){
+    inferenceBusy=true;
+    try{
+      lastVideoTime=video.currentTime;
+      result=handLandmarker.detectForVideo(video, performance.now());
+
+      if(result.landmarks?.length){
+        statusEl.textContent="Mana detectata ✓";
+        const gest=analyzeGesture(result.landmarks[0]);
+        gestureEl.textContent=gest.pinching ? "DESENEZ ✍️" : "Pregatit 🖐️";
+
+        if(gest.pinching){
+          const p=smoothPoint(gest.index);
+          if(!lastPinch){ currentStroke=[]; smoothed={...p}; }
+          const prev=currentStroke[currentStroke.length-1];
+          if(!prev || distance(prev,p)>3) currentStroke.push(p);
+          isDrawing=true;
+        }else if(lastPinch && currentStroke.length){
+          strokes.push(currentStroke.slice());
+          maybeRecognizeShape(currentStroke);
+          currentStroke=[];
+          smoothed=null;
+          isDrawing=false;
+        }
+        lastPinch=gest.pinching;
+      }else{
+        statusEl.textContent="Arata mana camerei";
+        gestureEl.textContent="—";
+        if(lastPinch && currentStroke.length){
+          strokes.push(currentStroke.slice());
+          maybeRecognizeShape(currentStroke);
+          currentStroke=[];
+        }
+        lastPinch=false; smoothed=null;
+      }
+      drawScene(result);
+    }catch(e){
+      console.error(e);
+      statusEl.textContent="Eroare detectare";
+    }finally{
+      inferenceBusy=false;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+clearBtn.addEventListener("click",()=>{
+  strokes=[];currentStroke=[];smoothed=null;
+  showToast("Desen sters");
+});
+switchBtn.addEventListener("click",async()=>{
+  facingMode = facingMode==="user" ? "environment" : "user";
+  video.style.transform = facingMode==="user" ? "scaleX(-1)" : "none";
+  await startCamera();
+});
+handBtn.addEventListener("click",()=>{
+  showHand=!showHand;
+  handBtn.textContent="🖐 Repere mana: "+(showHand?"ON":"OFF");
+});
+saveBtn.addEventListener("click",()=>{
+  const out=document.createElement("canvas");
+  out.width=video.videoWidth||1280;out.height=video.videoHeight||720;
+  const og=out.getContext("2d");
+  if(facingMode==="user"){
+    og.save();og.translate(out.width,0);og.scale(-1,1);og.drawImage(video,0,0,out.width,out.height);og.restore();
+  }else og.drawImage(video,0,0,out.width,out.height);
+
+  const sx=out.width/innerWidth, sy=out.height/innerHeight;
+  og.lineCap="round";og.lineJoin="round";og.lineWidth=8*Math.max(sx,sy);og.strokeStyle="#00e5ff";og.shadowColor="#00e5ff";og.shadowBlur=14;
+  for(const s of strokes){
+    og.beginPath();
+    s.forEach((p,i)=>i?og.lineTo(p.x*sx,p.y*sy):og.moveTo(p.x*sx,p.y*sy));
+    og.stroke();
+  }
+  const a=document.createElement("a");
+  a.href=out.toDataURL("image/png");
+  a.download="aventura_lui_matei_ar.png";
+  a.click();
+});
+startBtn.addEventListener("click",startCamera);
+</script>
+</body>
+</html>
